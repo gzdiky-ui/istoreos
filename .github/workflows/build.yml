@@ -1,167 +1,153 @@
-# .github/workflows/build.yml
+# iStoreOS x86 云端编译 + 自动 Release
+#
+# 触发方式:
+#   1) 手动: GitHub Actions -> Build iStoreOS x86 -> Run workflow
+#      (可填 release_tag, 默认 latest-x86; 同名 Release 会被更新而不是新建)
+#   2) 自动: push 形如 v* 的 tag 时, 用该 tag 创建/更新 Release
+#
+# 运行器: ubuntu-24.04 (pinned)
+# 构建:   make defconfig (seed .config) -> make -j$(nproc) V=s
+# 产物:   bin/targets/x86/64/ 下 istoreos-x86-64-generic-*.img.gz
+# 校验:   目标/profile 选择检查 + 产物存在性检查 + sha256sum -c sha256sums
+# 发布:   仅当 build 作业全部成功时, release 作业才执行 (needs + if success)
+
 name: Build iStoreOS x86
 
 on:
-  # 手动触发（Action → Run workflow），可传入版本标签
   workflow_dispatch:
     inputs:
-      tag:
-        description: "发布标签 (如 v24.10.x)"
+      release_tag:
+        description: "Release tag (留空默认 latest-x86, 已存在则更新)"
         required: false
-        default: ""
-  # 打 Tag 时自动触发（v1.0.0 等格式）
+        default: "latest-x86"
   push:
     tags:
       - "v*"
 
-jobs:
-  build-x86:
-    runs-on: ubuntu-22.04
-    timeout-minutes: 120
+permissions:
+  contents: read
 
+jobs:
+  build:
+    name: build-x86
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
     steps:
-      # ── 1. 拉取源码 ──────────────────────────────────────────
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0          # 保留完整 git 历史
+          fetch-depth: 0
 
-      # ── 2. 安装编译依赖 ────────────────────────────────────────
-      - name: Install build dependencies
+      - name: Install build prerequisites
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            build-essential \
-            ccache \
-            pkg-config \
-            wget \
-            git \
-            ca-certificates \
-            libssl-dev \
-            libncurses-dev \
-            flex \
-            bison \
-            gawk \
-            quota \
-            swig \
-            python3-setuptools \
-            python3-pip \
-            libgmp-dev \
-            libmpc-dev \
-            libmpfr-dev \
-            libisl-dev \
-            gperf \
-            libexpat-dev \
-            autoconf \
-            automake \
-            libtool \
-            libncurses5-dev \
-            libz-dev \
-            xz-utils \
-            unzip \
-            bc \
-            libattr1-dev \
-            libcap-dev \
-            libelf-dev \
-            liblzma-dev \
-            libparted-dev \
-            libxml2-dev \
-            libjson-c-dev \
-            zlib1g-dev \
-            liblzma-dev \
-            gperf \
-            libgmp3-dev \
-            libmpc-dev \
-            libmpfr-dev \
-            libisl-dev \
-            flex \
-            bison \
-            gawk \
-            python3-pip \
-            swig \
-            libssl-dev \
-            libncurses-dev \
-            libattr1-dev \
-            libcap-dev \
-            libelf-dev \
-            liblzma-dev \
-            libparted-dev \
-            libxml2-dev \
-            libjson-c-dev \
-            zlib1g-dev
+          sudo apt-get install -y --no-install-recommends \
+            build-essential gcc g++ make libncurses-dev flex bison gawk \
+            findutils devscripts diffstat quilt libssl-dev libelf-dev \
+            zlib1g-dev liblzma-dev libzstd-dev libexpat-dev pkg-config
 
-      # ── 3. 准备构建环境 ────────────────────────────────────────
-      - name: Prepare build environment
+      - name: Seed minimal .config (x86/64 generic)
         run: |
-          export PATH="/usr/local/ccache:$PATH"
-          # 如果仓库内有 istoreos 子目录，进入该目录；否则在当前目录构建
-          if [ -d "istoreos" ]; then
-            cd istoreos
-          fi
-          # 拉取 feeds
-          ./scripts/feeds update -a
-          ./scripts/feeds install -a
+          printf '%s\n' \
+            'CONFIG_TARGET_x86=y' \
+            'CONFIG_TARGET_x86_64=y' \
+            'CONFIG_TARGET_x86_64_DEVICE_generic=y' \
+            > .config
 
-      # ── 4. 配置 x86-64 目标 ────────────────────────────────────
-      - name: Configure x86-64 target
+      - name: Generate full config (make defconfig)
+        run: make defconfig V=s
+
+      - name: Verify target & profile selection
         run: |
-          if [ -d "istoreos" ]; then cd istoreos; fi
-          # 确保选中 x86 64 位
-          make menuconfig TARGET=x86/64 2>/dev/null || true
-          # 如果项目没有交互式界面，直接写 .config
-          if [ -f ".config" ]; then
-            sed -i 's/# CONFIG_TARGET_x86 is not set/CONFIG_TARGET_x86=y/g' .config
-            sed -i 's/# CONFIG_TARGET_x86_64 is not set/CONFIG_TARGET_x86_64=y/g' .config
-          fi
-          make defconfig 2>/dev/null || true
+          grep -q '^CONFIG_TARGET_x86_64=y$' .config || { echo "::error::x86_64 target 未被选中"; exit 1; }
+          grep -q '^CONFIG_TARGET_x86_64_DEVICE_generic=y$' .config || { echo "::error::generic profile 未被选中"; exit 1; }
+          grep -q '^CONFIG_TARGET_IMAGES_GZIP=y$' .config || { echo "::error::镜像 gzip 开关异常"; exit 1; }
+          echo "=== 选中的 target 相关配置 ==="
+          grep -E '^CONFIG_TARGET' .config | sed -n '1,20p'
 
-      # ── 5. 编译 ────────────────────────────────────────────────
-      - name: Compile firmware
+      - name: Build (make -j$(nproc))
+        run: make -j"$(nproc)" V=s
+
+      - name: Verify artifacts exist
         run: |
-          if [ -d "istoreos" ]; then cd istoreos; fi
-          make -j"$(nproc)" V=s
+          BIN=bin/targets/x86/64
+          test -f "$BIN/istoreos-x86-64-generic-combined.img.gz"      || { echo "::error::缺少 combined.img.gz"; exit 1; }
+          test -f "$BIN/istoreos-x86-64-generic-combined-efi.img.gz"  || { echo "::error::缺少 combined-efi.img.gz"; exit 1; }
+          test -f "$BIN/istoreos-x86-64-generic-rootfs.img.gz"       || { echo "::error::缺少 rootfs.img.gz"; exit 1; }
+          test -f "$BIN/sha256sums"                                 || { echo "::error::缺少 sha256sums"; exit 1; }
+          test -f "$BIN/profiles.json"                              || { echo "::error::缺少 profiles.json"; exit 1; }
+          echo "=== bin/targets/x86/64 ==="
+          ls -lh "$BIN" | grep -E 'img\.gz|sha256sums|profiles\.json'
 
-      # ── 6. 收集产物 ────────────────────────────────────────────
-      - name: Collect artifacts
+      - name: Verify checksums (sha256sum -c)
+        working-directory: bin/targets/x86/64
         run: |
-          WORKDIR="istoreos"
-          [ ! -d "$WORKDIR" ] && WORKDIR="."
-          mkdir -p ./artifacts
-          # 典型输出路径
-          find "$WORKDIR/bin/targets/x86/64" -name "*.img" -o -name "*.img.gz" -o -name "*.bin" 2>/dev/null | while read f; do
-            cp "$f" ./artifacts/
-          done
-          # 兜底：也收集 x86/generic 路径
-          find "$WORKDIR/bin/targets/x86/generic" -name "*.img" -o -name "*.img.gz" -o -name "*.bin" 2>/dev/null | while read f; do
-            cp "$f" ./artifacts/
-          done
-          echo "产物列表："
-          ls -lh ./artifacts/
+          sha256sum -c sha256sums
+          echo "=== 校验通过 ==="
+          sha256sum -c <(grep -E 'istoreos-x86-64-generic-(combined|combined-efi|rootfs)\.img\.gz$' sha256sums)
 
-      # ── 7. 上传 Release（仅 Tag 触发）─────────────────────────
-      - name: Create / update GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            artifacts/*
-          generate_release_notes: true
-          draft: false
-          prerelease: false
-
-      # ── 8. 手动触发时也上传（附加到已有 Release 或创建新 Release）
-      - name: Upload for manual trigger
-        if: github.event_name == 'workflow_dispatch'
+      - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: firmware-x86-${{ github.run_number }}
-          path: artifacts/*
-          retention-days: 30
+          name: istoreos-x86-64
+          path: |
+            bin/targets/x86/64/istoreos-x86-64-generic-*.img.gz
+            bin/targets/x86/64/sha256sums
+            bin/targets/x86/64/profiles.json
+          if-no-files-found: error
+          retention-days: 90
 
-      # ── 9. 构建失败通知（可选，需要 webhook / 飞书 / 企业微信）──
-      # - name: Notify failure
-      #   if: failure()
-      #   run: |
-      #     curl -s -X POST "https://oapi.dingtalk.com/robot/send?access_token=YOUR_TOKEN" \
-      #       -H "Content-Type: application/json" \
-      #       -d '{"msgtype":"text","text":{"content":"构建失败: ${{ github.ref }}"}}'
+  release:
+    name: publish-release
+    needs: build
+    if: needs.build.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: istoreos-x86-64
+          path: release-files
+
+      - name: Generate release body
+        id: body
+        run: |
+          OUT="$RUNNER_TEMP/release-body.md"
+          {
+            echo "iStoreOS x86_64 (generic) — 由 GitHub Actions 构建并发布"
+            echo ""
+            echo "- Commit: \`${{ github.sha }}\`"
+            echo "- Branch/Ref: \`${{ github.ref_name }}\`"
+            echo "- 构建作业: [${{ github.workflow_run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.workflow_run_id }})"
+            echo ""
+            echo "## 附件校验 (sha256sum -c sha256sums 已在构建中通过)"
+            echo ""
+            echo '```'
+            ls -l release-files | awk '{print $5, $9}' | sed 's/^/  /'
+            echo '```'
+            echo ""
+            echo "sha256sums:"
+            echo '```'
+            cat release-files/sha256sums
+            echo '```'
+          } > "$OUT"
+          BODY=$(cat "$OUT")
+          echo "body<<RELEASE_BODY_EOF" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "$BODY" >> "$GITHUB_OUTPUT"
+          echo "RELEASE_BODY_EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Create / update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.release_tag || github.ref_name }}
+          name: iStoreOS x86_64 ${{ github.event.inputs.release_tag || github.ref_name }}
+          body: ${{ steps.body.outputs.body }}
+          files: release-files/*
+          fail_on_unmatched_files: true
+          delete_other_files: false
+          generate_release_notes: false
+          prerelease: false
+          draft: false
