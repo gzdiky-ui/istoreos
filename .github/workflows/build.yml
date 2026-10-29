@@ -1,0 +1,167 @@
+# .github/workflows/build.yml
+name: Build iStoreOS x86
+
+on:
+  # 手动触发（Action → Run workflow），可传入版本标签
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "发布标签 (如 v24.10.x)"
+        required: false
+        default: ""
+  # 打 Tag 时自动触发（v1.0.0 等格式）
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build-x86:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+
+    steps:
+      # ── 1. 拉取源码 ──────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # 保留完整 git 历史
+
+      # ── 2. 安装编译依赖 ────────────────────────────────────────
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            ccache \
+            pkg-config \
+            wget \
+            git \
+            ca-certificates \
+            libssl-dev \
+            libncurses-dev \
+            flex \
+            bison \
+            gawk \
+            quota \
+            swig \
+            python3-setuptools \
+            python3-pip \
+            libgmp-dev \
+            libmpc-dev \
+            libmpfr-dev \
+            libisl-dev \
+            gperf \
+            libexpat-dev \
+            autoconf \
+            automake \
+            libtool \
+            libncurses5-dev \
+            libz-dev \
+            xz-utils \
+            unzip \
+            bc \
+            libattr1-dev \
+            libcap-dev \
+            libelf-dev \
+            liblzma-dev \
+            libparted-dev \
+            libxml2-dev \
+            libjson-c-dev \
+            zlib1g-dev \
+            liblzma-dev \
+            gperf \
+            libgmp3-dev \
+            libmpc-dev \
+            libmpfr-dev \
+            libisl-dev \
+            flex \
+            bison \
+            gawk \
+            python3-pip \
+            swig \
+            libssl-dev \
+            libncurses-dev \
+            libattr1-dev \
+            libcap-dev \
+            libelf-dev \
+            liblzma-dev \
+            libparted-dev \
+            libxml2-dev \
+            libjson-c-dev \
+            zlib1g-dev
+
+      # ── 3. 准备构建环境 ────────────────────────────────────────
+      - name: Prepare build environment
+        run: |
+          export PATH="/usr/local/ccache:$PATH"
+          # 如果仓库内有 istoreos 子目录，进入该目录；否则在当前目录构建
+          if [ -d "istoreos" ]; then
+            cd istoreos
+          fi
+          # 拉取 feeds
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      # ── 4. 配置 x86-64 目标 ────────────────────────────────────
+      - name: Configure x86-64 target
+        run: |
+          if [ -d "istoreos" ]; then cd istoreos; fi
+          # 确保选中 x86 64 位
+          make menuconfig TARGET=x86/64 2>/dev/null || true
+          # 如果项目没有交互式界面，直接写 .config
+          if [ -f ".config" ]; then
+            sed -i 's/# CONFIG_TARGET_x86 is not set/CONFIG_TARGET_x86=y/g' .config
+            sed -i 's/# CONFIG_TARGET_x86_64 is not set/CONFIG_TARGET_x86_64=y/g' .config
+          fi
+          make defconfig 2>/dev/null || true
+
+      # ── 5. 编译 ────────────────────────────────────────────────
+      - name: Compile firmware
+        run: |
+          if [ -d "istoreos" ]; then cd istoreos; fi
+          make -j"$(nproc)" V=s
+
+      # ── 6. 收集产物 ────────────────────────────────────────────
+      - name: Collect artifacts
+        run: |
+          WORKDIR="istoreos"
+          [ ! -d "$WORKDIR" ] && WORKDIR="."
+          mkdir -p ./artifacts
+          # 典型输出路径
+          find "$WORKDIR/bin/targets/x86/64" -name "*.img" -o -name "*.img.gz" -o -name "*.bin" 2>/dev/null | while read f; do
+            cp "$f" ./artifacts/
+          done
+          # 兜底：也收集 x86/generic 路径
+          find "$WORKDIR/bin/targets/x86/generic" -name "*.img" -o -name "*.img.gz" -o -name "*.bin" 2>/dev/null | while read f; do
+            cp "$f" ./artifacts/
+          done
+          echo "产物列表："
+          ls -lh ./artifacts/
+
+      # ── 7. 上传 Release（仅 Tag 触发）─────────────────────────
+      - name: Create / update GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/*
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+
+      # ── 8. 手动触发时也上传（附加到已有 Release 或创建新 Release）
+      - name: Upload for manual trigger
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-x86-${{ github.run_number }}
+          path: artifacts/*
+          retention-days: 30
+
+      # ── 9. 构建失败通知（可选，需要 webhook / 飞书 / 企业微信）──
+      # - name: Notify failure
+      #   if: failure()
+      #   run: |
+      #     curl -s -X POST "https://oapi.dingtalk.com/robot/send?access_token=YOUR_TOKEN" \
+      #       -H "Content-Type: application/json" \
+      #       -d '{"msgtype":"text","text":{"content":"构建失败: ${{ github.ref }}"}}'
