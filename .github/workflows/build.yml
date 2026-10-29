@@ -66,7 +66,21 @@ jobs:
           grep -E '^CONFIG_TARGET' .config | sed -n '1,20p'
 
       - name: Build (make -j$(nproc))
-        run: make -j"$(nproc)" V=s
+        run: |
+          set -o pipefail
+          make -j"$(nproc)" V=s 2>&1 | tee build_full.log
+          rc=${PIPESTATUS[0]}
+          echo "=== make exit code: $rc ==="
+          exit "$rc"
+
+      - name: Upload build log (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-failed
+          path: build_full.log
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Verify artifacts exist
         run: |
